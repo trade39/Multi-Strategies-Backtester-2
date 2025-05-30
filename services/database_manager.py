@@ -3,6 +3,7 @@
 Manages all database interactions for caching market data and storing results.
 Uses SQLite for simplicity and portability.
 Includes indexing for improved query performance.
+Database connection is cached using Streamlit's cache_resource.
 """
 import sqlite3
 import pandas as pd
@@ -10,6 +11,7 @@ import numpy as np # Added for handling np.nan if necessary
 import json # For storing dicts like performance metrics
 from datetime import datetime, date
 import os # For ensuring data directory exists
+import streamlit as st # Added for st.cache_resource
 
 from utils.logger import get_logger # Assuming logger.py is in 'utils'
 from config import settings # For NY_TIMEZONE_STR
@@ -18,23 +20,43 @@ logger = get_logger(__name__)
 
 DB_FILE_PATH = "data/ict_strategies_app.db" # Store DB in a 'data' subdirectory
 
+@st.cache_resource(show_spinner=False) # Cache the database connection
 def get_db_connection():
-    """Establishes and returns a database connection."""
+    """
+    Establishes and returns a database connection.
+    The connection is cached using st.cache_resource for efficiency across the app session.
+    Ensures the 'data' directory for the database file exists.
+    """
+    logger.info(f"Attempting to establish database connection to: {DB_FILE_PATH}")
     try:
         # Ensure the 'data' directory exists
-        os.makedirs(os.path.dirname(DB_FILE_PATH), exist_ok=True)
+        db_dir = os.path.dirname(DB_FILE_PATH)
+        if not os.path.exists(db_dir):
+            os.makedirs(db_dir)
+            logger.info(f"Created database directory: {db_dir}")
         
         conn = sqlite3.connect(DB_FILE_PATH, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
         conn.row_factory = sqlite3.Row # Access columns by name
+        logger.info(f"Database connection to {DB_FILE_PATH} established successfully.")
         return conn
     except sqlite3.Error as e:
         logger.error(f"Database connection error to {DB_FILE_PATH}: {e}", exc_info=True)
-        raise # Re-raise the exception to be handled by the caller
+        st.error(f"Fatal Error: Could not connect to the application database: {e}. Please check logs and ensure write permissions for the 'data' directory.")
+        raise # Re-raise the exception to be handled by the caller or halt app
+    except Exception as e:
+        logger.error(f"An unexpected error occurred while establishing DB connection: {e}", exc_info=True)
+        st.error(f"Fatal Error: An unexpected issue occurred with the database setup: {e}.")
+        raise
+
 
 def init_db():
-    """Initializes the database and creates tables and indexes if they don't exist."""
+    """
+    Initializes the database and creates tables and indexes if they don't exist.
+    Uses the cached database connection.
+    """
     try:
-        with get_db_connection() as conn:
+        conn = get_db_connection() # Get the cached connection
+        with conn: # Use the connection as a context manager for commit/rollback
             cursor = conn.cursor()
 
             # Market Data Cache Table
@@ -42,7 +64,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS market_data_cache (
                 ticker TEXT NOT NULL,
                 interval TEXT NOT NULL,
-                data_timestamp TIMESTAMP NOT NULL, -- Stored as TEXT by pandas if not careful, ensure it's recognized as TIMESTAMP
+                data_timestamp TIMESTAMP NOT NULL,
                 Open REAL,
                 High REAL,
                 Low REAL,
@@ -51,13 +73,12 @@ def init_db():
                 PRIMARY KEY (ticker, interval, data_timestamp)
             )
             """)
-            logger.info("Table 'market_data_cache' checked/created.")
-            # Index for market_data_cache
+            logger.debug("Table 'market_data_cache' checked/created.")
             cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_market_data_ticker_interval_ts 
             ON market_data_cache (ticker, interval, data_timestamp)
             """)
-            logger.info("Index 'idx_market_data_ticker_interval_ts' for 'market_data_cache' checked/created.")
+            logger.debug("Index 'idx_market_data_ticker_interval_ts' for 'market_data_cache' checked/created.")
 
             # Backtest Runs Table (Summary)
             cursor.execute("""
@@ -67,50 +88,47 @@ def init_db():
                 strategy_name TEXT NOT NULL,
                 ticker TEXT NOT NULL,
                 timeframe TEXT NOT NULL,
-                start_date DATE NOT NULL, -- Stored as TEXT
-                end_date DATE NOT NULL,   -- Stored as TEXT
+                start_date DATE NOT NULL, 
+                end_date DATE NOT NULL,   
                 initial_capital REAL,
                 risk_per_trade_percent REAL,
-                parameters TEXT, -- JSON string of specific params
-                source TEXT, -- e.g., 'Manual', 'Optimization', 'WFO'
-                performance_metrics TEXT, -- JSON string of performance dict
-                equity_curve TEXT -- JSON string of equity curve (timestamp: value)
+                parameters TEXT, 
+                source TEXT, 
+                performance_metrics TEXT, 
+                equity_curve TEXT 
             )
             """)
-            logger.info("Table 'backtest_runs' checked/created.")
-            # Index for backtest_runs
+            logger.debug("Table 'backtest_runs' checked/created.")
             cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_backtest_runs_lookup 
             ON backtest_runs (strategy_name, ticker, timeframe, run_timestamp DESC)
-            """) # run_timestamp DESC for fetching recent runs faster
-            logger.info("Index 'idx_backtest_runs_lookup' for 'backtest_runs' checked/created.")
-
+            """)
+            logger.debug("Index 'idx_backtest_runs_lookup' for 'backtest_runs' checked/created.")
 
             # Trades Log Table
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS trades_log (
                 trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id INTEGER NOT NULL, -- Foreign key to backtest_runs
+                run_id INTEGER NOT NULL, 
                 EntryTime TIMESTAMP,
                 EntryPrice REAL,
-                Type TEXT, -- 'Long' or 'Short'
+                Type TEXT, 
                 SL REAL,
                 TP REAL,
                 PositionSize REAL,
                 ExitTime TIMESTAMP,
                 ExitPrice REAL,
-                P_L REAL, -- P&L for the trade
+                P_L REAL, 
                 ExitReason TEXT,
                 FOREIGN KEY (run_id) REFERENCES backtest_runs (run_id) ON DELETE CASCADE
             )
             """)
-            logger.info("Table 'trades_log' checked/created.")
-            # Index for trades_log
+            logger.debug("Table 'trades_log' checked/created.")
             cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_trades_log_run_id 
             ON trades_log (run_id)
             """)
-            logger.info("Index 'idx_trades_log_run_id' for 'trades_log' checked/created.")
+            logger.debug("Index 'idx_trades_log_run_id' for 'trades_log' checked/created.")
 
             # Optimization Results Table
             cursor.execute("""
@@ -120,28 +138,30 @@ def init_db():
                 strategy_name TEXT NOT NULL,
                 ticker TEXT NOT NULL,
                 timeframe TEXT NOT NULL,
-                start_date DATE NOT NULL, -- Stored as TEXT
-                end_date DATE NOT NULL,   -- Stored as TEXT
+                start_date DATE NOT NULL, 
+                end_date DATE NOT NULL,   
                 optimization_algorithm TEXT,
                 optimized_metric TEXT,
-                results_dataframe TEXT, -- JSON string of the entire optimization results DataFrame
-                extra_config TEXT DEFAULT NULL -- JSON string for additional config like AI settings
+                results_dataframe TEXT, 
+                extra_config TEXT DEFAULT NULL 
             )
             """)
-            logger.info("Table 'optimization_results' checked/created.")
-             # Index for optimization_results
+            logger.debug("Table 'optimization_results' checked/created.")
             cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_optimization_results_lookup 
             ON optimization_results (strategy_name, ticker, timeframe, opt_timestamp DESC)
             """)
-            logger.info("Index 'idx_optimization_results_lookup' for 'optimization_results' checked/created.")
+            logger.debug("Index 'idx_optimization_results_lookup' for 'optimization_results' checked/created.")
             
-            conn.commit()
-        logger.info(f"Database '{DB_FILE_PATH}' initialized successfully with tables and indexes.")
+            # conn.commit() # Handled by 'with conn:' context manager
+        logger.info(f"Database '{DB_FILE_PATH}' initialized successfully with tables and indexes using cached connection.")
     except sqlite3.Error as e:
-        logger.error(f"Error initializing database: {e}", exc_info=True)
-    except Exception as e: # Catch any other unexpected error
-        logger.error(f"An unexpected error occurred during DB initialization: {e}", exc_info=True)
+        logger.error(f"Error initializing database schema: {e}", exc_info=True)
+        # If init_db fails, it's a critical error for the app's operation with DB.
+        st.error(f"Critical Error: Could not initialize the database schema: {e}. The application might not function correctly with database features.")
+    except Exception as e: 
+        logger.error(f"An unexpected error occurred during DB schema initialization: {e}", exc_info=True)
+        st.error(f"Critical Error: An unexpected issue occurred during database schema setup: {e}.")
 
 
 # --- Market Data Cache Functions ---
@@ -177,7 +197,6 @@ def save_market_data(ticker: str, interval: str, data_df: pd.DataFrame):
             return
 
     df_to_save = df_to_save.reset_index()
-    # Standardize timestamp column name
     df_to_save.rename(columns={'index': 'data_timestamp', 'Datetime': 'data_timestamp', 'Timestamp': 'data_timestamp'}, inplace=True, errors='ignore')
     
     if 'data_timestamp' not in df_to_save.columns:
@@ -194,17 +213,13 @@ def save_market_data(ticker: str, interval: str, data_df: pd.DataFrame):
     df_to_save['interval'] = interval
     db_cols = ['ticker', 'interval', 'data_timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
     df_to_save = df_to_save[db_cols]
-    # Ensure data_timestamp is in a format SQLite understands as TIMESTAMP for comparisons
-    # Pandas to_sql usually handles datetime64[ns, TZ] to ISO8601 strings, which SQLite can compare.
-    # df_to_save['data_timestamp'] = df_to_save['data_timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S.%f') # Explicit conversion if issues
 
     try:
-        with get_db_connection() as conn:
+        conn = get_db_connection() # Get the cached connection
+        with conn: # Use the connection as a context manager
             if not df_to_save.empty:
                 min_ts = df_to_save['data_timestamp'].min()
                 max_ts = df_to_save['data_timestamp'].max()
-                # Convert Timestamps to string for SQL query if they are not already
-                # This is important as SQLite might treat raw Timestamp objects differently than ISO strings
                 min_ts_str = pd.Timestamp(min_ts).isoformat()
                 max_ts_str = pd.Timestamp(max_ts).isoformat()
 
@@ -214,7 +229,7 @@ def save_market_data(ticker: str, interval: str, data_df: pd.DataFrame):
                 """
                 conn.execute(delete_query, (ticker, interval, min_ts_str, max_ts_str))
                 df_to_save.to_sql('market_data_cache', conn, if_exists='append', index=False)
-                conn.commit()
+                # conn.commit() # Handled by 'with conn:'
                 logger.info(f"Saved/Updated {len(df_to_save)} rows of market data for {ticker} ({interval}) to cache. Range: {min_ts} to {max_ts}")
     except sqlite3.Error as e:
         logger.error(f"Error saving market data for {ticker} ({interval}) to cache: {e}", exc_info=True)
@@ -225,30 +240,29 @@ def save_market_data(ticker: str, interval: str, data_df: pd.DataFrame):
 def load_market_data(ticker: str, interval: str, start_date: datetime, end_date: datetime) -> pd.DataFrame:
     """Loads market data from cache for the given ticker, interval, and date range (inclusive)."""
     try:
-        with get_db_connection() as conn:
-            # Convert start_date and end_date to NY-aware timestamps for query
-            start_dt_ny = pd.Timestamp(start_date, tz=settings.NY_TIMEZONE_STR).isoformat()
-            end_dt_ny = (pd.Timestamp(end_date, tz=settings.NY_TIMEZONE_STR) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)).isoformat()
+        conn = get_db_connection() # Get the cached connection
+        # No 'with conn:' here as pd.read_sql_query handles its own cursor/connection lifecycle for the query
+        
+        start_dt_ny = pd.Timestamp(start_date, tz=settings.NY_TIMEZONE_STR).isoformat()
+        end_dt_ny = (pd.Timestamp(end_date, tz=settings.NY_TIMEZONE_STR) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)).isoformat()
 
-            query = """
-            SELECT data_timestamp, Open, High, Low, Close, Volume 
-            FROM market_data_cache
-            WHERE ticker = ? AND interval = ? AND data_timestamp BETWEEN ? AND ?
-            ORDER BY data_timestamp ASC
-            """
-            df = pd.read_sql_query(query, conn, params=(ticker, interval, start_dt_ny, end_dt_ny))
+        query = """
+        SELECT data_timestamp, Open, High, Low, Close, Volume 
+        FROM market_data_cache
+        WHERE ticker = ? AND interval = ? AND data_timestamp BETWEEN ? AND ?
+        ORDER BY data_timestamp ASC
+        """
+        df = pd.read_sql_query(query, conn, params=(ticker, interval, start_dt_ny, end_dt_ny))
 
         if not df.empty:
-            df['data_timestamp'] = pd.to_datetime(df['data_timestamp']) # Convert from string if needed
-            # Ensure timezone is NYT, as it's stored that way (or should be)
+            df['data_timestamp'] = pd.to_datetime(df['data_timestamp']) 
             if df['data_timestamp'].dt.tz is None:
-                 df['data_timestamp'] = df['data_timestamp'].dt.tz_localize('UTC').dt.tz_convert(settings.NY_TIMEZONE_STR) # Assume UTC if naive
+                 df['data_timestamp'] = df['data_timestamp'].dt.tz_localize('UTC').dt.tz_convert(settings.NY_TIMEZONE_STR) 
             elif str(df['data_timestamp'].dt.tz) != settings.NY_TIMEZONE_STR:
                  df['data_timestamp'] = df['data_timestamp'].dt.tz_convert(settings.NY_TIMEZONE_STR)
 
             df.set_index('data_timestamp', inplace=True)
             
-            # Verify if the loaded data fully covers the requested range
             user_req_start_ts_ny = pd.Timestamp(start_date, tz=settings.NY_TIMEZONE_STR)
             user_req_end_ts_ny_day_start = pd.Timestamp(end_date, tz=settings.NY_TIMEZONE_STR)
 
@@ -261,7 +275,7 @@ def load_market_data(ticker: str, interval: str, start_date: datetime, end_date:
         else:
             logger.info(f"No market data found in cache for {ticker} ({interval}) for range {start_dt_ny} to {end_dt_ny}.")
         
-        return pd.DataFrame() # Return empty if not fully covered or not found
+        return pd.DataFrame() 
             
     except sqlite3.Error as e:
         logger.error(f"Error loading market data for {ticker} ({interval}) from cache: {e}", exc_info=True)
@@ -280,7 +294,8 @@ def save_backtest_results(
     ) -> int | None:
     """Saves backtest summary, trades, and equity curve to the database."""
     try:
-        with get_db_connection() as conn:
+        conn = get_db_connection() # Get the cached connection
+        with conn: # Use the connection as a context manager
             cursor = conn.cursor()
             
             params_json = json.dumps(parameters, default=str)
@@ -305,21 +320,19 @@ def save_backtest_results(
                 trades_to_save['run_id'] = run_id
                 for col in ['EntryTime', 'ExitTime']:
                     if col in trades_to_save.columns:
-                        # Ensure datetime objects are converted to ISO format strings for SQLite
                         trades_to_save[col] = pd.to_datetime(trades_to_save[col]).map(lambda x: x.isoformat() if pd.notnull(x) else None)
 
                 trades_to_save.rename(columns={'P&L': 'P_L'}, inplace=True)
                 trade_db_cols = ['run_id', 'EntryTime', 'EntryPrice', 'Type', 'SL', 'TP', 
                                  'PositionSize', 'ExitTime', 'ExitPrice', 'P_L', 'ExitReason']
                 
-                # Ensure all columns exist, add NaNs if not
                 for tc in trade_db_cols:
                     if tc not in trades_to_save.columns:
                         trades_to_save[tc] = np.nan 
                 trades_to_save = trades_to_save[trade_db_cols]
                 trades_to_save.to_sql('trades_log', conn, if_exists='append', index=False)
             
-            conn.commit()
+            # conn.commit() # Handled by 'with conn:'
             logger.info(f"Backtest results for strategy '{strategy_name}' on '{ticker}' saved with run_id: {run_id}")
             return run_id
     except sqlite3.Error as e:
@@ -333,14 +346,15 @@ def save_optimization_results(
     start_date_dt: date, end_date_dt: date,
     optimization_algorithm: str, optimized_metric: str,
     results_df: pd.DataFrame,
-    extra_config: dict | None = None # Added for AI settings etc.
+    extra_config: dict | None = None 
     ):
     """Saves optimization results DataFrame to the database."""
     if results_df.empty:
         logger.info("Optimization results DataFrame is empty, not saving.")
         return
     try:
-        with get_db_connection() as conn:
+        conn = get_db_connection() # Get the cached connection
+        with conn: # Use the connection as a context manager
             results_json = results_df.to_json(orient='records', date_format='iso', default_handler=str)
             extra_config_json = json.dumps(extra_config, default=str) if extra_config else None
 
@@ -353,8 +367,16 @@ def save_optimization_results(
                 start_date_dt.isoformat(), end_date_dt.isoformat(),
                 optimization_algorithm, optimized_metric, results_json, extra_config_json
             ))
-            conn.commit()
-            opt_run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            # conn.commit() # Handled by 'with conn:'
+            # To get lastrowid after execute within a 'with conn:' block, it should be fine.
+            # For robustness, one might use a cursor if specific control over lastrowid is needed before commit.
+            # However, for INSERT, lastrowid is typically available on the connection or cursor after execute.
+            # Let's assume conn.execute followed by a SELECT last_insert_rowid() on a new cursor within the same transaction works.
+            # Or, more simply, if we don't need the opt_run_id immediately, this is fine.
+            # If opt_run_id is strictly needed:
+            cursor = conn.cursor()
+            cursor.execute("SELECT last_insert_rowid()")
+            opt_run_id = cursor.fetchone()[0]
             logger.info(f"Optimization results for strategy '{strategy_name}' on '{ticker}' saved with opt_run_id: {opt_run_id}. Extra config: {extra_config_json is not None}")
     except sqlite3.Error as e:
         logger.error(f"Error saving optimization results: {e}", exc_info=True)
@@ -363,13 +385,9 @@ def save_optimization_results(
 
 if __name__ == '__main__':
     logger.info("Running database_manager.py directly for testing DB initialization.")
-    init_db()
+    # This will now use the cached connection for the init_db call.
+    # If running this script standalone, Streamlit context might not be fully available for @st.cache_resource,
+    # so it might behave like a normal function call.
+    # For full @st.cache_resource behavior, it needs to be run within a Streamlit app execution.
+    init_db() 
     logger.info("Database manager test run complete. Check for 'ict_strategies_app.db' in 'data/' directory and log messages for table/index creation.")
-
-    # Example: Test saving optimization results with extra_config
-    # mock_opt_df_test = pd.DataFrame({
-    #     'SL Points': [10, 15], 'RRR': [2, 2.5], 'Total P&L': [1000, 1200]
-    # })
-    # mock_extra_config_test = {"AI_Filter_Enabled": True, "AI_Model": "RandomForest"}
-    # save_optimization_results("TestStrategy", "TESTTICKER", "15m", date(2023,1,1), date(2023,1,1), 
-    #                           "Grid Search", "Total P&L", mock_opt_df_test, mock_extra_config_test)

@@ -1,0 +1,166 @@
+# services/strategy_engine.py
+"""
+Main dispatcher for generating trading signals based on selected strategy.
+Imports and calls strategy-specific generation functions.
+Integrates AIModelService for signal filtering and potentially regime-adaptive logic.
+"""
+import pandas as pd
+from datetime import time as dt_time
+from config import settings
+from utils.logger import get_logger
+
+# Import strategy-specific signal generators
+from .strategies import gap_guardian, unicorn, silver_bullet
+from .ai_models import AIModelService # Import the AI service
+
+logger = get_logger(__name__)
+
+# Initialize AI Service globally or pass as an argument.
+# For simplicity in this structure, we can instantiate it here or pass it.
+# If state (trained models) needs to be managed across Streamlit sessions,
+# it's better to manage the AIModelService instance in app.py and pass it.
+# For now, let's assume it's instantiated when needed or passed.
+
+def generate_signals(
+    data: pd.DataFrame,
+    strategy_name: str,
+    stop_loss_points: float,
+    rrr: float,
+    entry_start_time: dt_time | None = None, # Optional, for Gap Guardian
+    entry_end_time: dt_time | None = None,   # Optional, for Gap Guardian
+    ai_service: AIModelService | None = None, # Pass the AI service instance
+    enable_signal_filtering: bool = False,
+    enable_regime_detection: bool = False # Placeholder for future use
+) -> pd.DataFrame:
+    """
+    Generates trading signals by dispatching to the appropriate strategy module,
+    optionally filtering signals using AI, and potentially adapting to market regimes.
+    """
+    if data.empty:
+        logger.warning("StrategyEngine: Input data for signal generation is empty.")
+        return pd.DataFrame()
+
+    # Ensure data is in New York timezone
+    if data.index.tz is None:
+        logger.warning(f"StrategyEngine: Data timezone is naive, localizing to NY. Original index head: {data.index[:3]}")
+        try:
+            data = data.tz_localize('UTC').tz_convert(settings.NY_TIMEZONE_STR)
+        except Exception as e:
+            logger.error(f"StrategyEngine: Failed to localize/convert data to NY timezone: {e}. Current tz: {data.index.tz}", exc_info=True)
+            return pd.DataFrame()
+    elif str(data.index.tz) != settings.NY_TIMEZONE_STR: # Compare string representations
+        logger.warning(f"StrategyEngine: Data timezone is {data.index.tz}, converting to NY. Original index head: {data.index[:3]}")
+        try:
+            data = data.tz_convert(settings.NY_TIMEZONE_STR)
+        except Exception as e:
+            logger.error(f"StrategyEngine: Failed to convert data to NY timezone: {e}. Current tz: {data.index.tz}", exc_info=True)
+            return pd.DataFrame()
+    
+    logger.info(f"StrategyEngine: Dispatching signal generation for strategy: {strategy_name} with SL: {stop_loss_points}, RRR: {rrr}.")
+
+    # --- Regime Detection (Placeholder Integration) ---
+    current_regime = "Unknown"
+    if enable_regime_detection and ai_service:
+        try:
+            # For real-time, detect regime based on data up to the current point.
+            # For backtesting, regime could be pre-calculated for each bar or detected on the fly.
+            # This is a simplified example; regime detection might need more context.
+            current_regime = ai_service.detect_regime(data) # Pass full historical data for now
+            logger.info(f"StrategyEngine: Detected market regime: {current_regime}")
+            # Future: Adapt strategy_params based on current_regime
+            # e.g., if current_regime == "Volatile": stop_loss_points *= 1.5
+        except Exception as e:
+            logger.error(f"StrategyEngine: Error during regime detection: {e}", exc_info=True)
+
+
+    # --- Core Strategy Signal Generation ---
+    raw_signals_df = pd.DataFrame()
+    strategy_params = {
+        'stop_loss_points': stop_loss_points,
+        'rrr': rrr,
+        # Add 'current_regime': current_regime if strategies are designed to use it
+    }
+
+    if strategy_name == "Gap Guardian":
+        if entry_start_time is None or entry_end_time is None:
+            logger.error("StrategyEngine: Gap Guardian requires entry_start_time and entry_end_time.")
+            return pd.DataFrame()
+        strategy_params.update({
+            'entry_start_time': entry_start_time,
+            'entry_end_time': entry_end_time
+        })
+        raw_signals_df = gap_guardian.generate_signals(data.copy(), **strategy_params)
+    elif strategy_name == "Unicorn":
+        raw_signals_df = unicorn.generate_signals(data.copy(), **strategy_params)
+    elif strategy_name == "Silver Bullet":
+        raw_signals_df = silver_bullet.generate_signals(data.copy(), **strategy_params)
+    else:
+        logger.error(f"StrategyEngine: Unknown strategy: {strategy_name}.")
+        return pd.DataFrame()
+
+    if raw_signals_df.empty:
+        logger.info(f"StrategyEngine: No raw signals generated by {strategy_name}.")
+        return pd.DataFrame()
+    logger.info(f"StrategyEngine: Generated {len(raw_signals_df)} raw signals for {strategy_name}.")
+
+    # --- AI Signal Filtering ---
+    final_signals_df = raw_signals_df
+    if enable_signal_filtering and ai_service:
+        if ai_service.signal_filter_model is not None:
+            logger.info(f"StrategyEngine: Applying AI signal filtering to {len(raw_signals_df)} signals.")
+            try:
+                # Pass a copy of price data to avoid modification issues if AI service does internal calcs
+                filtered_signals = ai_service.filter_signals(data.copy(), raw_signals_df.copy())
+                final_signals_df = filtered_signals
+                logger.info(f"StrategyEngine: AI filtering complete. {len(final_signals_df)} signals remain.")
+            except Exception as e:
+                logger.error(f"StrategyEngine: Error during AI signal filtering: {e}", exc_info=True)
+                # Fallback to raw signals if filtering fails
+                final_signals_df = raw_signals_df
+        else:
+            logger.warning("StrategyEngine: AI signal filtering enabled, but AI model is not loaded/trained in AI_Service. Using raw signals.")
+    
+    # Common post-processing for final signals
+    if not final_signals_df.empty:
+        # Ensure 'SignalTime' column exists and is the index
+        if 'SignalTime' not in final_signals_df.columns and not isinstance(final_signals_df.index, pd.DatetimeIndex):
+             logger.error(f"StrategyEngine: Final signals for {strategy_name} missing 'SignalTime' index or column.")
+             return pd.DataFrame() # Cannot proceed
+        elif 'SignalTime' in final_signals_df.columns and not isinstance(final_signals_df.index, pd.DatetimeIndex):
+            final_signals_df['SignalTime'] = pd.to_datetime(final_signals_df['SignalTime'])
+            final_signals_df.set_index('SignalTime', inplace=True)
+        elif isinstance(final_signals_df.index, pd.DatetimeIndex):
+            # Ensure SignalTime column exists if it was the index
+            if 'SignalTime' not in final_signals_df.columns:
+                final_signals_df = final_signals_df.reset_index()
+
+
+        # Ensure SignalTime is timezone-aware, matching the data's timezone (NYT)
+        if 'SignalTime' in final_signals_df.columns:
+            if final_signals_df['SignalTime'].dt.tz is None:
+                logger.warning(f"StrategyEngine: Final SignalTime for {strategy_name} is naive. Localizing to NYT.")
+                try:
+                    final_signals_df['SignalTime'] = final_signals_df['SignalTime'].dt.tz_localize(settings.NY_TIMEZONE_STR)
+                except Exception as tz_err:
+                     logger.warning(f"StrategyEngine: Could not localize final SignalTime: {tz_err}. Trying UTC then convert.")
+                     try:
+                        final_signals_df['SignalTime'] = final_signals_df['SignalTime'].dt.tz_localize('UTC').dt.tz_convert(settings.NY_TIMEZONE_STR)
+                     except Exception as conv_err:
+                        logger.error(f"StrategyEngine: Failed to convert final SignalTime to NYT: {conv_err}", exc_info=True)
+
+            elif str(final_signals_df['SignalTime'].dt.tz) != settings.NY_TIMEZONE_STR:
+                 logger.warning(f"StrategyEngine: Final SignalTime for {strategy_name} has tz {final_signals_df['SignalTime'].dt.tz}. Converting to NYT.")
+                 try:
+                    final_signals_df['SignalTime'] = final_signals_df['SignalTime'].dt.tz_convert(settings.NY_TIMEZONE_STR)
+                 except Exception as conv_err:
+                    logger.error(f"StrategyEngine: Failed to convert final SignalTime to NYT: {conv_err}", exc_info=True)
+            
+            # Set index again after potential modifications
+            final_signals_df.set_index('SignalTime', inplace=True, drop=False) # Keep SignalTime as column
+            final_signals_df.sort_index(inplace=True)
+
+        logger.info(f"StrategyEngine: Returning {len(final_signals_df)} final signals for {strategy_name}.")
+    else:
+        logger.info(f"StrategyEngine: No final signals to return for {strategy_name}.")
+        
+    return final_signals_df.copy() # Return a copy

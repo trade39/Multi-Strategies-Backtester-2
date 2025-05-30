@@ -1,0 +1,15 @@
+# Database files
+data/*.db
+data/ict_strategies_app.db
+
+# Other common Python ignores
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+*.env
+.env.*
+*.DS_Store

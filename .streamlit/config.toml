@@ -1,0 +1,82 @@
+[theme]
+base = "dark"
+primaryColor = "#7792E3" # A nice blue for primary elements
+backgroundColor = "#0E1117" # Standard dark background
+secondaryBackgroundColor = "#262730" # Slightly lighter for cards, sidebar etc.
+textColor = "#FAFAFA"
+font = "sans serif"
+
+[logger]
+# Level of logging: 'error', 'warning', 'info', or 'debug'.
+# Default is 'info'.
+level = "info"
+
+[runner]
+# Allow an app to inject HTML into the browser.
+# Default is false.
+# This is required for custom CSS.
+# DEPRECATED: Use st.markdown(unsafe_allow_html=True) instead.
+# However, keeping it here as some older setups might still look for it,
+# but modern Streamlit handles this via st.markdown.
+# For Streamlit Cloud, this setting in config.toml might not be necessary
+# if unsafe_allow_html is used in the app.
+# For broader compatibility, it's fine to include it.
+# It will be ignored if not applicable to the Streamlit version/environment.
+# unsafeAllowHtml = true # This is deprecated, use st.markdown(unsafe_allow_html=True)
+
+[server]
+# Max message size in megabytes.
+# Default is 50.
+# maxMessageSize = 50
+# Enable Cross-Origin Resource Sharing (CORS) protection.
+# Default is true.
+# enableCORS = true
+# Enable WebSocket compression.
+# Default is false.
+# enableWebsocketCompression = false
+# The address that the server should listen on.
+# Default is "" (all interfaces).
+# address = ""
+# The port that the server should listen on.
+# Default is 8501.
+# port = 8501
+# A comma-separated list of XSRF origins to accept.
+# Default is "".
+# xsrfCookies = ""
+# Enable XSRF protection.
+# Default is true.
+# enableXsrfProtection = true
+# Max upload size in megabytes.
+# Default is 200.
+# maxUploadSize = 200
+# Headless mode for Streamlit.
+# Default is false.
+# headless = false
+# Run the server in a way that it doesn't attempt to open a browser window.
+# Default is false.
+# runOnSave = false
+# Enable custom component serving.
+# Default is true.
+# componentWhitelist = ""
+# Enable static file serving.
+# Default is true.
+# allowStaticServing = true
+
+[client]
+# Whether to show a warning when a user sets a widget value to None.
+# Default is true.
+# showWarningOnDirectExecution = true
+# Toolbar mode for Streamlit.
+# Default is "developer".
+# toolbarMode = "developer" # "developer", "viewer", "minimal"
+
+[global]
+# Set the data frame serialization format.
+# Default is "arrow".
+# dataFrameSerialization = "arrow" # "arrow", "legacy"
+# Disable a few Streamlit features that may not work well in some iframe scenarios.
+# Default is false.
+# disableWatchdogWarning = false
+# Disable Streamlit's "beta" feature warnings.
+# Default is false.
+# disableBetaWarning = false
